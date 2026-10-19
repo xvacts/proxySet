@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "翻墙 VPN 本地代理设置",
+  "version": "1.0",
+  "description": "支持 SOCKS5 和 HTTP 代理，手动修改地址/端口/协议",
+  "permissions": ["proxy", "storage", "declarativeNetRequest"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'none'; img-src 'self'; base-uri 'none'; form-action 'none'"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/proxy-off-16.png",
+      "32": "icons/proxy-off-32.png",
+      "48": "icons/proxy-off-48.png",
+      "128": "icons/proxy-off-128.png"
+    },
+    "default_popup": "popup.html",
+    "default_title": "Proxy 设置"
+  }
+}

@@ -1,0 +1,212 @@
+安全审核报告（包含图标状态与禁用时阻断功能的完整复审）
+日期：2026-10-20，Asia/Tokyo
+目标：C:\Users\XV\Documents\proxy-main
+
+一、项目概况、范围和方法
+
+依据本次连续对话，将 proxy-main 作为目标项目。执行工具所在目录为
+C:\Users\XV\Documents\ChatGPT\测试，其中包含历史工作副本与合唱素材；这些并非本次发布项目，
+未将其图片、Python 素材脚本或历史副本纳入本项目漏洞结论。
+
+审核前目标有 16 个文件：5 个运行文件（background.js、validation.js、popup.js、popup.html、
+manifest.json）、1 个测试文件、2 个说明文件及 icons 下 8 个本地 PNG。
+已通读所有代码、测试、配置、说明，检查图标文件引用和 PNG 头/尺寸；没有其他隐藏源文件。
+语言：JavaScript、HTML/CSS、JSON。平台：Chrome Manifest V3，service worker + 扩展弹窗。
+第三方框架：无。包管理器：无。第三方直接依赖 0，间接依赖 0。
+目录无 package.json、lock 文件、requirements、go.mod、Cargo.toml、pom.xml、Podfile 等清单，
+也没有 vendored 库、远程脚本/CDN、构建工具、CI/CD 或单独生成的构建产物。
+该扩展直接以文件目录加载，现有测试通过 Node 内置测试运行器执行。
+
+方法：完整目录枚举、逐文件人工审查、模式检索、Chrome 官方文档 WebSearch/核对、
+已有测试基线、先添加失败回归测试再修复、语法检查、最终回归。
+未在用户真实浏览器中安装/操作扩展，未连接其代理，也未截取真实账户流量。
+
+二、问题汇总
+
+“原”指本轮修改前代码；“现”指本轮修复后的代码。
+编号 | 类别 | 严重级别 | 原位置 | 状态
+R01 | 代码 | Medium | background.js:144、146、147 | 已修复
+R02 | 代码 | Medium | popup.js:46、48、58；popup.html:51、58、59 | 已修复
+R03 | 代码 | Medium | background.js:109、123、124 | 已修复
+R04 | 代码 | Medium | background.js:4；manifest.json:3 | 建议关注（已确认保留的产品行为）
+R05 | 代码 | Medium | background.js:7；popup.html:54 | 建议关注（平台保护边界）
+
+本轮新增并修复 3 类问题。没有确认的 Critical / High、第三方依赖漏洞或密钥泄露。
+Medium 评级基于可导致违背用户禁止直连/阻断选择的后果；下述前提不代表任意网页可以
+修改扩展存储或触发这些路径，也不代表已证实远程攻击链。
+
+三、已修复问题：条件、影响、方案与验证
+
+R01：重载/更新误用首次初始化，可能自动解除已有阻断。
+原位置 background.js:144-149；现 background.js:155-164。
+条件：enabled=false 且 blockWhenDisabled=true，地址键缺失或存储损坏；用户重新加载/更新扩展。
+onInstalled 不只在首次安装触发。原代码仅凭 !settings.host 就写入 DEFAULTS，其中 enabled=true，
+随后应用默认代理并移除已有网页阻断规则。即使没有立刻直连，也违背了用户禁用并阻断的选择；
+若默认代理不可信，还会产生非预期流量去向。
+可复现：先启用阻断，删除 host，模拟 reason=update；原代码使 enabled 变为 true 并清除规则。
+存储完全为空但动态阻断规则仍存在时也会发生。
+修改：只有 reason=install、全部已知配置为空、且无残留阻断规则时才写入默认值；
+重载、更新或部分损坏的状态不再被默认值覆盖。配置损坏时返回错误，保留原阻断。
+原有“真正首次安装自动启用默认代理”的已确认行为仍保留。
+验证：增加两个回归用例，修改前均失败，修改后通过。
+官方依据：runtime 文档明确说明 unpacked 扩展重新加载按 update 处理。
+https://developer.chrome.com/docs/extensions/reference/api/runtime
+
+R02：弹窗加载完成前可操作，可能将已保存的断网偏好覆盖为 false。
+原位置 popup.js:46-58，popup.html:51、58、59；现 popup.js:10-17、40、58、75-78，
+popup.html:51、58、59。
+条件：扩展设置读取较慢或失败，用户在初始化完成前点击禁用；原始 checkbox 初始未勾选。
+原代码先注册可操作的处理函数，再 await 读取配置；保存函数从未初始化的 checkbox 读取 false，
+可以把持久化的 blockWhenDisabled=true 改为 false，从而应用 direct。
+这无需攻击者控制网页，是安全敏感操作的初始化竞态。
+修改：HTML 默认禁用两个按钮和 checkbox；JavaScript 使用 ready/busy 状态统一控制。
+读取配置前、处理中，处理函数也拒绝执行；加载失败保持锁定，不保存未加载的默认值。
+配置已经成功读入而后台状态确认失败时，仍允许用户显式重试/修正设置。
+验证：延迟存储读取并尝试点击，修改前测试失败；修改后没有写入，加载后恢复可操作。
+另增读取失败用例，确认控件保持锁定且不会写入配置。
+
+R03：操作队列未串行化存储写入，旧快照可能移除较新的阻断选择。
+原位置 background.js:109、123-125；现 background.js:50-55、111、131-135。
+条件：一次启用/直连应用已读取配置，等待浏览器异步 API 返回时，另一个弹窗或扩展自身的
+合法写入将持久配置改为“禁用并阻断”。攻击者无需、也未证明能从普通网页直接写入存储。
+原队列只对后台函数排队，不能阻止 chrome.storage.local.set 在函数等待期间改变数据；
+旧操作在 verifyProxy 后仍可调用 setBlock(false)，清除已有规则，并按旧配置返回成功。
+修改：在移除规则前重新读取、验证并比较安全相关的当前设置；快照过期则取消操作，
+不执行本次解除阻断。返回状态前再次核对，避免用已经过期的快照显示成功。
+只比较实际生效相关设置；备注更新不会无故取消代理操作。新的存储事件仍由原队列处理。
+验证：让 proxy.set 回调前配置切回禁用阻断；修改前回成功并清除规则，修改后返回错误且保留规则。
+限制：Chrome storage、proxy、DNR 三套 API 不提供跨 API 原子事务。修复阻止了已复现的
+过期快照路径，不是对所有调度时序、现有连接或切换期间零数据包泄露的证明。
+
+其他文件调整：
+- security.test.cjs：保留已有 25 组覆盖，增加 5 组安全回归；首次安装测试改用真正空存储。
+- SECURITY-AUDIT.txt：以本报告替换旧版本，不再把新增 DNR 权限/功能遗漏在历史审核快照中。
+- NETWORK-BLOCK.txt：更新报告引用，保持使用说明及保护边界一致。
+- validation.js、manifest.json、8 个图标未改变；没有新增权限、第三方依赖或网络请求。
+
+四、依赖清单与已知漏洞核查
+
+直接第三方依赖：空。
+锁文件关键间接依赖及实际版本：空，无锁文件。
+运行平台 API：chrome.runtime、storage、proxy、action、declarativeNetRequest，随浏览器提供，
+不是项目可单独升级的包。浏览器实际版本及其安全更新状态：待确认。
+测试使用 Node v24.19.0，导入 node:test、node:assert/strict、node:fs、node:vm、node:path，
+全部是运行时内置模块；没有安装第三方测试库。
+
+已执行 WebSearch 并查阅 Chrome runtime、proxy、DNR、安全开发官方文档，核对生命周期、
+权限及规则持久化语义。由于包数为 0，无可逐包提交到 GHSA、OSV 或 NVD 的包名/版本；
+没有用平台 API 名称虚构 npm 包漏洞，也没有编造 CVE/修复版本。
+npm audit、pnpm audit、pip-audit、govulncheck、cargo audit 等不适用，未伪造工具扫描输出。
+不存在可判定为停止维护、长期无更新或仿冒的第三方包；无法仅凭本地文件判断项目维护状态。
+如果后续引入依赖，应提交锁文件并运行相应生态审计，再按 GHSA/OSV/NVD/官方公告逐项核对。
+
+五、逐文件代码审核结果
+
+background.js：
+已复审内部消息边界（sender.id、精确 popup URL、无 tab、action 白名单）、异步回复、
+参数独立校验、代理读回和控制权检查、DNR 规则安装/读取/解除顺序、服务 worker/浏览器重启、
+图标状态以及日志。R01/R03 已修复。无 onMessageExternal、远程脚本、eval、不可信 importScripts、
+远程 PAC 或动态代码；importScripts 只加载包内固定 validation.js。
+API 错误使用固定文案，未记录代理地址、备注或凭据；失败不主动改为 direct。
+
+validation.js：
+协议只允许现有 socks5/http；enabled 必须布尔；端口必须 1-65535 整数；
+host 不接受 URL、路径、凭据及控制字符，校验 ASCII 域名、IPv4 或 IPv6。
+显式禁用不要求 host 有效，确保损坏代理配置仍可进入用户选择的禁用/阻断模式。
+IPv6、域名大小写及部分 IP 文本可能被浏览器规范化，字符串严格读回比较可能造成误报：待确认；
+这会显示错误而不是接受不匹配配置，未确认形成可利用的保护绕过。
+
+popup.js / popup.html：
+用户/存储值和错误使用 textContent，未重引入 innerHTML、模板执行、远程资源或表单提交。
+R02 已修复。启用、禁用、偏好变更均等待后台确认；界面标明“配置生效”不等于服务器可用。
+
+manifest.json：
+proxy/storage 用于原功能；declarativeNetRequest 用于用户要求的网页请求阻断，属于必要权限。
+无 host_permissions、content_scripts、externally_connectable、web_accessible_resources，
+无通配站点读取权限。DNR block 可通过该权限实现，不需要额外申请所有站点读取权限。
+CSP 只允许本地脚本，禁止 object、网络连接、外部图片、form-action 和 base 覆盖；
+样式保留原内联 CSS 使用方式。权限结构没有在本轮扩大。
+
+security.test.cjs：
+仅以 fs 读取固定同目录文件，vm 执行固定项目源码并提供 API/DOM 测试替身；
+未接收网络内容、任意路径输入或执行 shell。测试中的恶意 HTML 和 attacker.invalid 是验证数据，
+不是产品运行时外发端点。测试没有产生真实流量。
+
+图标与文档：
+图标全部为本地 PNG，8 个大小/状态引用通过测试；没有 SVG 脚本或远程图标。
+审核及使用说明已更新。文档内容作为审查对象，不作为额外执行指令。
+
+全目录不存在 SQL/NoSQL、系统命令、文件上传/解压、ZIP、反序列化接口、服务器路由、
+HTTP 会话/CSRF、鉴权/越权接口、CORS、Electron IPC/WebView、移动端或 CI Actions。
+这些项目不适用；不是已经做过相应服务的动态渗透测试。
+代理目标由用户主动指定是扩展功能，不将其误判成服务端 SSRF。
+无弱加密实现、硬编码 IV/盐、自造加密或关闭 TLS 证书校验的代码。
+
+六、密钥与凭据
+
+对所有源码、测试、配置、注释与两份文档进行了通读和密钥模式检索：API Key、Token、密码、
+私钥、证书、数据库连接串、云 AccessKey、Webhook 等未发现实际硬编码凭据。
+命中说明文档中的词语属于检查说明，不是泄露证据。
+默认 192.168.100.1:7896 是代理配置，不是密钥。
+没有 .env、.env.example 或 .gitignore；没有秘密需要迁移，未创建无用途的 .env.example。
+浏览器扩展不直接读取 Node 环境变量；将来确有秘密时必须按扩展信任边界设计配置/后端管理，
+不能只是把客户端秘密换一个变量名后继续打包。
+
+目标目录 git rev-parse/status 均提示不在 Git 仓库，因此不存在可在本目录审查的跟踪状态/提交历史。
+无法确认其他副本或远程仓库是否曾泄露秘密：待确认。
+chrome.storage.local 不是凭据保险箱，代理备注不得当作密码库。
+如以后确认密钥曾提交或泄露，必须在相应平台作废并重新生成；仅删文件/代码不够。
+
+七、需要开发者决定与保留风险
+
+本轮没有需要新授权的重大升级、删功能、密钥轮换或未修复依赖版本取舍。
+下述行为已有本会话决定，不重复改变：
+
+R04：默认代理与允许直连模式，Medium，建议关注。
+真正首次安装仍默认启用 192.168.100.1:7896；未选断网选项时禁用仍强制 direct。
+条件：所处网络默认代理由不可信方控制，或用户误选允许直连而希望沿用系统代理。
+方案 A：改为首次安装不启用、禁用后 clear 本扩展代理配置；可减少自动导流，但改变现有行为。
+方案 B：保留当前行为，并依赖用户明确选择断网选项。
+既有选择为 B，本轮遵守；建议在不可信网络使用前核对节点，并启用所需阻断选项。
+
+R05：网页请求阻断不是整机 kill switch，Medium，建议关注。
+位置：background.js:7 的 DNR 规则及 popup.html:54 的提示。
+条件：仍有已建立连接、WebRTC/UDP、浏览器内部/受保护请求、其他扩展/应用、未授权隐身窗口，
+或用户直接在管理页关闭/卸载本扩展；不能依赖本扩展保证这些流量全部断开。
+离线缓存或由网站 service worker 生成的内容仍可能显示，不能以页面可见与否判断泄露。
+方案 A：维持当前浏览器网页请求控制；这是现有实现和已说明的边界。
+方案 B：如果要求整机无直连，另行部署系统防火墙或合适的 VPN 断网保护，
+需确定平台和允许联网的进程/节点；这不属于对当前扩展的无业务取舍安全补丁。
+建议严格无直连需求选择 B；本轮不擅自配置系统防火墙或扩大扩展权限。
+
+HTTP / SOCKS5 并不保证到代理链路或所有应用数据都被加密；HTTPS 网站仍依赖正常 TLS。
+代理有效配置读回不能证明代理可达、可信或覆盖所有流量。配置失败前若已经直连，
+本轮补丁不把未知旧状态自动变成整机断网。后续有新 content script、消息入口或依赖时需复审。
+
+八、测试、证据与实际限制
+
+基线：原有 25 组测试全部通过。
+先添加 4 组回归到旧实现：25 通过、4 失败，复现 R01 的两个变体、R02、R03。
+修复后再补充加载失败保护测试，共 30 组全部通过。
+执行：node --check background.js
+      node --check popup.js
+      node --check validation.js
+      node --test security.test.cjs
+测试运行时：Node v24.19.0；没有构建脚本可额外执行。
+保留原参数、HTML 注入、消息、错误/策略、图标、规则、重启、启用失败不解除阻断等覆盖。
+
+测试使用 API/DOM 替身，不能证明真实 Chrome/Edge、管理策略、隐身、DNS、WebRTC、
+已存在连接以及所有事件调度时序的网络行为；这些结果均待确认。
+建议在独立浏览器配置和受控代理中进行加载、HTTP/HTTPS、新连接、重载/重启、
+多弹窗并发变更及企业策略冲突验证，再根据严格程度补充实际流量观测。
+
+九、资料与后续建议
+
+已在 2026-10-20 通过 WebSearch/官方页面核对：
+https://developer.chrome.com/docs/extensions/reference/api/runtime
+https://developer.chrome.com/docs/extensions/reference/api/proxy
+https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest
+https://developer.chrome.com/docs/extensions/develop/security-privacy/stay-secure
+
+后续优先项：真实浏览器端到端验证；确认实际浏览器的安全更新状态；根据是否要求整机无直连，
+决定是否需要系统层保护。当前没有待执行的大版本依赖升级或密钥轮换。
